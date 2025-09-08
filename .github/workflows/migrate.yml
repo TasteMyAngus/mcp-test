@@ -1,0 +1,75 @@
+name: Migrate Artifacts
+on:
+  workflow_dispatch:
+    inputs:
+      repos_manifest:
+        description: JSON array of repo keys ["repo1", "repo2"]
+        required: true
+      jfrog_base:
+        description: Base URL of your JFrog (e.g. https://your.jfrog.io)
+        required: true
+      target_namespace:
+        description: GHCR namespace (e.g. ghcr.io/${{ github.repository_owner }}/migrated)
+        required: true
+permissions:
+  contents: write
+  packages: write
+jobs:
+  push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install ORAS
+        run: |
+          curl -sL https://github.com/oras-project/oras/releases/latest/download/oras_$(uname -s | tr '[:upper:]' '[:lower:]')_amd64.tar.gz \
+          | tar -xz && sudo mv oras /usr/local/bin/oras
+      - name: Login to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u ${{ github.actor }} --password-stdin
+      - name: Migrate from JFrog repos → GHCR (OCI)
+        env:
+          JFROG_TOKEN: ${{ secrets.JFROG_TOKEN }}
+          JFROG_BASE: ${{ inputs.jfrog_base }}
+          NS: ${{ inputs.target_namespace }}
+          REPOS: ${{ inputs.repos_manifest }}
+        run: |
+          python - <<'PY'
+          import os, json, subprocess, os.path as p, urllib.request
+
+          jfrog = os.environ['JFROG_BASE'].rstrip('/')
+          token = os.environ['JFROG_TOKEN']
+          ns    = os.environ['NS'].rstrip('/')
+          repos = json.loads(os.environ['REPOS'])
+
+          def aql(repo):
+              q = f"items.find({{" + f"\"repo\":{{\"$eq\":\"{repo}\"}}}}).include(\"repo\",\"path\",\"name\",\"sha256\")"
+              req = urllib.request.Request(jfrog + "/artifactory/api/search/aql", data=q.encode('utf-8'), method='POST')
+              req.add_header('Authorization', 'Bearer ' + token)
+              with urllib.request.urlopen(req) as r:
+                  return json.loads(r.read())
+
+          def dl(url, out):
+              req = urllib.request.Request(url)
+              req.add_header('Authorization', 'Bearer ' + token)
+              with urllib.request.urlopen(req) as r, open(out,'wb') as f:
+                  f.write(r.read())
+
+          total = 0
+          for repo in repos:
+              print(f"==> Repo: {repo}")
+              res = aql(repo)
+              items = res.get('results', [])
+              print(f"    {len(items)} items")
+              for i,it in enumerate(items,1):
+                  path = (it.get('path') or '').strip('/')
+                  name = it.get('name')
+                  url  = f"{jfrog}/artifactory/{repo}/" + (path + '/' if path else '') + name
+                  out  = name
+                  print(f"    [{i}/{len(items)}] {url}")
+                  try:
+                      dl(url, out)
+                      ref = f"{ns}/{repo.replace('/', '-')}/{path.replace('/', '-') or 'root'}:{name}"
+                      subprocess.check_call(["oras","push",ref,f"{out}:application/octet-stream"])
+                      total += 1
+                  except Exception as e:
+                      print("WARN:", e)
+          print(f"Pushed {total} artifacts")
+          PY
